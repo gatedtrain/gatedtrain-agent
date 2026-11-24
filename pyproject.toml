@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gatedtrain-agent"
+version = "0.1.0"
+readme = "README.md"
+description = "Agent drivers (MCP server and a do command) for gatedtrain AI-native projects"
+requires-python = ">=3.12,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = ["gatedtrain>=0.5,<0.6", "mcp>=2.3,<3", "pyyaml>=6"]
+
+[project.scripts]
+gatedtrain-agent = "gatedtrain_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gatedtrain_agent = ["skill/SKILL.md"]
