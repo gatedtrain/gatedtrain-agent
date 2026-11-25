@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from _support import write_fake_cli
 from gatedtrain_agent import runs
@@ -140,6 +141,147 @@ class RunsTests(unittest.TestCase):
         info = runs.start(client, self.root, "train", None)
         self.assertEqual(json.loads((agent / "run.lock").read_text())["pid"], info["pid"])
         self.assertTrue(runs.wait(client, self.root, "train", 10)["envelope"].ok)
+
+    def test_concurrent_takeover_of_a_stale_lock_has_one_winner(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        agent = self.root / "agent"
+        agent.mkdir()
+        (agent / "run.lock").write_text(json.dumps({"stage": "old", "pid": dead.pid}))
+        # The interleaving that breaks an unserialised takeover: both starters judge the lock stale, then s0 removes
+        # it and creates its own, then s1 acts on its old verdict (removing s0's new lock) and creates too. Hold
+        # s1 back after its verdict until s0 is done; when takeover is serialised the waits just time out.
+        barrier = threading.Barrier(2)
+        s0_done = threading.Event()
+        real = runs._lock_state
+
+        def state(root):
+            verdict = real(root)
+            if verdict[0] == "stale":
+                try:
+                    barrier.wait(timeout=1.0)
+                except threading.BrokenBarrierError:
+                    pass
+                if threading.current_thread().name == "s1":
+                    s0_done.wait(timeout=2.0)
+            return verdict
+
+        results = []
+
+        def acquire(stage):
+            try:
+                runs._acquire(self.root, stage)
+                results.append("won")
+            except runs.RunBusy:
+                results.append("busy")
+            finally:
+                if stage == "s0":
+                    s0_done.set()
+
+        with mock.patch.object(runs, "_lock_state", state):
+            threads = [threading.Thread(target=acquire, args=(f"s{i}",), name=f"s{i}") for i in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+        self.assertEqual(sorted(results), ["busy", "won"])
+
+    def test_start_kills_and_reaps_the_child_when_a_write_fails(self):
+        client = self.client(30)
+        # The lock write right after Popen fails.
+        self.enterContext(mock.patch.object(runs, "_write_lock", side_effect=OSError("disk full")))
+        spawned = []
+        real = subprocess.Popen
+
+        def spy(*args, **kwargs):
+            proc = real(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        with mock.patch.object(runs.subprocess, "Popen", spy):
+            with self.assertRaises(OSError):
+                runs.start(client, self.root, "train", None)
+        self.assertEqual(len(spawned), 1)
+        # wait() already ran: the child is reaped (a return code is known), not a zombie or still running.
+        self.assertIsNotNone(spawned[0].returncode)
+        self.assertFalse(runs._pid_alive(spawned[0].pid))
+        self.assertFalse((self.root / "agent" / "run.lock").exists())
+
+    def test_a_live_child_keeps_the_lock_live_after_its_owner_died(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        with runs.hold(self.root, "train") as held:
+            held.child(child.pid)
+            content = json.loads((self.root / "agent" / "run.lock").read_text())
+            self.assertEqual(content["child"]["pid"], child.pid)
+            self.assertEqual(content["child"]["start"], runs._start_time(child.pid))
+            # The owner dies without cleanup: its pid is gone but the child still runs.
+            content["pid"] = dead.pid
+            (self.root / "agent" / "run.lock").write_text(json.dumps(content))
+            self.assertEqual(runs.running(self.root)["stage"], "train")
+            with self.assertRaises(runs.RunBusy):
+                runs.start(self.client(0), self.root, "other", None)
+            child.kill()
+            child.wait()
+            self.assertIsNone(runs.running(self.root))
+            # Restore ownership so hold's own cleanup removes the lock.
+            content["pid"] = os.getpid()
+            (self.root / "agent" / "run.lock").write_text(json.dumps(content))
+
+    def test_start_and_wait_handle_large_output(self):
+        body = 'for _ in range(60000):\n    print("n" * 99)\n' + BODY.format(sleep=0)
+        client = Client(write_fake_cli(self.dir, body))
+        runs.start(client, self.root, "train", None)
+        result = runs.wait(client, self.root, "train", 30)
+        self.assertTrue(result["envelope"].ok)
+        self.assertGreater((self.root / "agent" / "runs" / "train.out").stat().st_size, 5_000_000)
+
+    def test_a_zombie_is_not_alive(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        self.addCleanup(child.wait)
+        deadline = time.monotonic() + 10
+        while runs._stat_fields(child.pid)[0] != "Z" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(runs._pid_alive(child.pid))
+        self.assertFalse(runs._pid_alive(child.pid, runs._start_time(child.pid)))
+
+    def test_a_superseded_run_leaves_no_return_code(self):
+        client = self.client(0.5)
+        info = runs.start(client, self.root, "train", None)
+        record = self.root / "agent" / "runs" / "train.json"
+        record.write_text(json.dumps({"pid": info["pid"] + 1}))  # a newer run replaced this one's record
+        for t in threading.enumerate():
+            if t.name.startswith("reap-"):
+                t.join(timeout=10)
+        self.assertFalse((self.root / "agent" / "runs" / "train.rc").exists())
+        self.assertFalse((self.root / "agent" / "run.lock").exists())
+
+    def test_a_failed_start_does_not_remove_a_lock_another_starter_took_over(self):
+        client = self.client(30)
+        other = {"stage": "other", "pid": os.getpid(), "start": runs._start_time(os.getpid())}
+
+        def write(lock, content):
+            # Our child is now dead, so a concurrent starter judged the lock stale and took it over...
+            lock.write_text(json.dumps(other))
+            raise OSError("then our own write failed")
+
+        self.enterContext(mock.patch.object(runs, "_write_lock", write))
+        with self.assertRaises(OSError):
+            runs.start(client, self.root, "train", None)
+        # ... and our failure path must leave that lock alone.
+        self.assertEqual(json.loads((self.root / "agent" / "run.lock").read_text()), other)
+
+    def test_hold_clears_the_previous_run_under_the_guard(self):
+        runs_dir = self.root / "agent" / "runs"
+        runs_dir.mkdir(parents=True)
+        (runs_dir / "train.json").write_text("{}")
+        (runs_dir / "train.rc").write_text("0")
+        with runs.hold(self.root, "train"):
+            self.assertFalse((runs_dir / "train.json").exists())
+            self.assertFalse((runs_dir / "train.rc").exists())
 
     def test_decision_file_written_and_passed(self):
         client = self.client(0.1)

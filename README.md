@@ -45,7 +45,7 @@ The package is not on PyPI yet. Install it from this repository at a release tag
 the `gatedtrain` you use:
 
 ```sh
-pip install "gatedtrain-agent @ git+https://github.com/gatedtrain/gatedtrain-agent@v0.1.0"
+pip install "gatedtrain-agent @ git+https://github.com/gatedtrain/gatedtrain-agent@v0.1.1"
 ```
 
 This installs `gatedtrain>=0.5,<0.6`, the MCP Python SDK (`mcp>=2.3,<3`) and `pyyaml>=6`.
@@ -168,7 +168,30 @@ Cooperative, that is, kept by what this package does and not enforced against a 
   false PASS.
 - "One stage at a time" is a lock file in `<root>/agent/` that both drivers respect: the MCP server holds it for a
   background run and `do` holds it while it runs a stage in the foreground, so neither can start a stage beside the
-  other. It does not stop someone who runs `gatedtrain` directly.
+  other. The lock also records the `gatedtrain` process `do` started, so it stays live while that process runs even
+  if `do` itself is killed with SIGKILL (not in the instant between the child's start and that record). It does not
+  stop someone who runs `gatedtrain` directly.
+- Ctrl-C during `do` stops the running stage (the terminal's signal reaches it too, with a grace period before it is
+  terminated), releases the lock and exits 130 with a one-line message.
+
+## Changes
+
+### 0.1.1
+
+Fixes five run-lock edge cases:
+
+- Taking over a stale run lock is serialised with a `flock` guard, so two starters can no longer both win.
+- `stage_run` kills and reaps its child when a write after the child's start fails.
+- `do` records its `gatedtrain` child in the lock, so a SIGKILLed `do` still reads as running while the child runs.
+- Ctrl-C during a foreground `do` stops the stage, releases the lock and exits 130 with a one-line message.
+- A timed-out call no longer waits for grandchildren that hold its pipes.
+
+Known residual gap, unchanged: if `do` is SIGKILLed in the instant between starting its `gatedtrain` child and
+recording that child in the lock, the lock does not cover the child and a second driver can start a stage beside it.
+
+### 0.1.0
+
+First release: the `do` command, the MCP server and the operator skill.
 
 ## Tests
 

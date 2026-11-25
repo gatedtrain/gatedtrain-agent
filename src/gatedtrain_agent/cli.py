@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from gatedtrain_agent.client import Client
-from gatedtrain_agent.walker import walk
+from gatedtrain_agent.walker import EXIT_INTERRUPTED, walk
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -69,7 +69,11 @@ def _mcp(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    return args.func(args, parser)
+    try:
+        return args.func(args, parser)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":
