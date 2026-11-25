@@ -6,12 +6,14 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 PREFIX_ENV = "GATEDTRAIN_AGENT_CLI"
 RESULT_SCHEMA = "gatedtrain.cli_result"
 TIMEOUT_EXIT = 124
+INTERRUPT_GRACE_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,26 @@ def _error(args: list[str], returncode: int, what: str, stdout: str, stderr: str
     return Envelope(" ".join(args[:2]), False, returncode, {}, [problem], [])
 
 
+def _stop(proc: subprocess.Popen, grace: float) -> None:
+    """Wait `grace` seconds for the child to exit (draining its pipes so it cannot block on a full one), then
+    terminate it, then kill it; always reap it."""
+    try:
+        for action in (None, proc.terminate):
+            if action is not None:
+                action()
+            try:
+                proc.communicate(timeout=grace)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+        proc.kill()
+        proc.wait()
+    except BaseException:  # a second Ctrl-C: do not leave the child behind
+        proc.kill()
+        proc.wait()
+        raise
+
+
 class Client:
     def __init__(self, prefix: list[str] | None = None, timeout: float | None = None):
         self.prefix = list(prefix) if prefix is not None else cli_prefix()
@@ -61,16 +83,38 @@ class Client:
     def argv(self, args: list[str]) -> list[str]:
         return [*self.prefix, "--json", *args]
 
-    def call(self, args: list[str]) -> Envelope:
+    def call(self, args: list[str], on_start: Callable[[int], None] | None = None) -> Envelope:
+        """Run one gatedtrain command and parse its result. `on_start` gets the child's pid right after it starts.
+
+        On Ctrl-C the child (which the terminal also signalled) gets a grace period to exit, then is terminated
+        and killed; it is always reaped before the interrupt propagates."""
+        argv = self.argv(args)
         try:
-            proc = subprocess.run(self.argv(args), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                  errors="replace", timeout=self.timeout, check=False)
-        except subprocess.TimeoutExpired as exc:
-            out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            return _error(args, TIMEOUT_EXIT, f"gatedtrain did not finish within {self.timeout} seconds", out)
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, errors="replace")
         except OSError as exc:
             return _error(args, 127, f"cannot start gatedtrain: {exc}", "")
-        return self.parse(proc.stdout, proc.returncode, args, proc.stderr or "")
+        with proc:
+            try:
+                if on_start is not None:
+                    on_start(proc.pid)
+                stdout, stderr = proc.communicate(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                # A grandchild may still hold the pipes: read what is there, but never wait for it.
+                try:
+                    out, _ = proc.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired as exc:
+                    out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+                return _error(args, TIMEOUT_EXIT, f"gatedtrain did not finish within {self.timeout} seconds", out)
+            except KeyboardInterrupt:
+                _stop(proc, INTERRUPT_GRACE_SECONDS)
+                raise
+            except BaseException:
+                _stop(proc, 0)
+                raise
+        return self.parse(stdout, proc.returncode, args, stderr or "")
 
     @staticmethod
     def parse(stdout: str, returncode: int, args: list[str], stderr: str = "") -> Envelope:

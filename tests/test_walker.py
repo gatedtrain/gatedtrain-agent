@@ -210,8 +210,8 @@ class WalkerTest(unittest.TestCase):
     def test_lock_release_error_after_the_run_reports_the_run(self) -> None:
         real = self.client.call
 
-        def call(args):
-            env = real(args)
+        def call(args, **kw):
+            env = real(args, **kw)
             if args[:2] == ["project", "run"]:
                 lock = self.root / "agent" / "run.lock"
                 lock.unlink()
@@ -228,18 +228,30 @@ class WalkerTest(unittest.TestCase):
         table = {"status": status(done=["a", "gate", "report"]), "report": {"data": {"report": {"status": "PASS"}}}}
         real = self.client.call
 
-        def spy(args):
+        def spy(args, **kw):
             if args[:2] == ["project", "run"]:
                 try:
                     runs.start(self.client, self.root, "x", None)
                 except runs.RunBusy as exc:
                     seen.append(str(exc))
-            return real(args)
+            return real(args, **kw)
         self.client.call = spy
         code, _ = self.walk(table, ask=lambda _p: "yes")
         self.assertEqual(code, 0)
         self.assertEqual(len(seen), 1)
         self.assertIn("preregister", seen[0])
+        self.assertFalse((self.root / "agent" / "run.lock").exists())
+
+    def test_ctrl_c_during_a_run_reports_the_stage_and_releases_the_lock(self) -> None:
+        def call(args, **kw):
+            if args[:2] == ["project", "run"]:
+                raise KeyboardInterrupt
+            return real(args, **kw)
+        real = self.client.call
+        self.client.call = call
+        code, out = self.walk({"status": status()})
+        self.assertEqual(code, 130)
+        self.assertIn("a: interrupted", out)
         self.assertFalse((self.root / "agent" / "run.lock").exists())
 
     def test_refusal_exit_3_with_problem_lines(self) -> None:

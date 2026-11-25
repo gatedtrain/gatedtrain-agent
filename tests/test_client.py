@@ -1,10 +1,14 @@
 import os
+import signal
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from _support import write_fake_cli
+from gatedtrain_agent import client as client_module
 from gatedtrain_agent.client import Client, Envelope, cli_prefix
 
 ENVELOPE = (
@@ -73,6 +77,68 @@ class ClientTests(unittest.TestCase):
         self.assertFalse(env.ok)
         self.assertEqual(env.exit_code, 124)
         self.assertEqual(env.problems[0]["rule"], "AGENT")
+
+    def test_large_stdout_and_stderr_do_not_block_or_get_lost(self):
+        body = ('for _ in range(80000):\n    print("n" * 99)\n'
+                'sys.stderr.write(("e" * 99 + "\\n") * 80000)\n' + ENVELOPE)
+        env = Client(write_fake_cli(self.dir, body)).call(["run", "stage"])
+        self.assertEqual(env.exit_code, 3)
+        self.assertEqual(env.problems[0]["rule"], "R1")
+
+    def test_large_output_without_an_envelope_keeps_only_a_tail(self):
+        body = 'for _ in range(80000):\n    print("n" * 99)\nprint("END-MARK")\nsys.exit(1)\n'
+        env = Client(write_fake_cli(self.dir, body)).call(["run", "stage"])
+        self.assertEqual(env.problems[0]["rule"], "AGENT")
+        self.assertLess(len(env.problems[0]["message"]), 1000)
+        self.assertIn("END-MARK", env.problems[0]["message"])
+
+    def test_on_start_receives_the_child_pid_before_it_finishes(self):
+        seen = []
+        client = Client(write_fake_cli(self.dir, "time.sleep(0.3)\n" + ENVELOPE))
+        env = client.call(["run", "stage"], on_start=seen.append)
+        self.assertEqual(env.exit_code, 3)
+        self.assertEqual(len(seen), 1)
+        self.assertGreater(seen[0], 0)
+
+    def test_interrupt_stops_and_reaps_the_child(self):
+        old = client_module.INTERRUPT_GRACE_SECONDS
+        client_module.INTERRUPT_GRACE_SECONDS = 0.2
+        self.addCleanup(setattr, client_module, "INTERRUPT_GRACE_SECONDS", old)
+        pids = []
+        client = Client(write_fake_cli(self.dir, "time.sleep(60)\n"))
+        timer = threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGINT))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with self.assertRaises(KeyboardInterrupt):
+            client.call(["run", "stage"], on_start=pids.append)
+        self.assertEqual(len(pids), 1)
+        # Reaped: no zombie left behind (a zombie still answers kill(pid, 0)).
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pids[0], os.WNOHANG)
+        self.assertFalse(os.path.exists(f"/proc/{pids[0]}"))
+
+    def test_timeout_does_not_wait_for_a_grandchild_holding_the_pipes(self):
+        body = ('import subprocess\n'
+                'subprocess.Popen([sys.executable, "-c", "import time; time.sleep(8)"])\n'
+                'time.sleep(60)\n')
+        t0 = time.monotonic()
+        env = Client(write_fake_cli(self.dir, body), timeout=0.5).call(["x", "y"])
+        self.assertLess(time.monotonic() - t0, 5)
+        self.assertEqual(env.exit_code, 124)
+
+    def test_a_failing_on_start_stops_and_reaps_the_child(self):
+        pids = []
+
+        def fail(pid):
+            pids.append(pid)
+            raise OSError("lock write failed")
+
+        client = Client(write_fake_cli(self.dir, "time.sleep(60)\n"))
+        with self.assertRaises(OSError):
+            client.call(["run", "stage"], on_start=fail)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pids[0], os.WNOHANG)
+        self.assertFalse(os.path.exists(f"/proc/{pids[0]}"))
 
     def test_prefix_env(self):
         with mock.patch.dict(os.environ, {"GATEDTRAIN_AGENT_CLI": '["a", "b"]'}):

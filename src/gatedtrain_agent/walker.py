@@ -15,6 +15,7 @@ from gatedtrain_agent.runs import RunBusy, hold
 EXIT_NEEDS_PERSON = 4
 _EXIT_NOT_PASS = 1
 _EXIT_REFUSED = 3
+EXIT_INTERRUPTED = 130
 
 
 def _decision_file(root: Path, stage: str, decision: dict) -> Path:
@@ -131,11 +132,14 @@ def walk(client: Client, root: Path, *, accept_inconclusive: bool = False,
         path: Path | None = None
         env: Envelope | None = None
         try:
-            with hold(root, name):
+            with hold(root, name) as held:
                 if decision is not None:
                     path = _decision_file(root, name, decision)
                     args += ["--decision", str(path)]
-                env = client.call(args)
+                env = client.call(args, on_start=held.child)
+        except KeyboardInterrupt:
+            print(f"{name}: interrupted", file=out)
+            return EXIT_INTERRUPTED
         except RunBusy as exc:
             return _busy(out, exc)
         except (OSError, ValueError) as exc:
