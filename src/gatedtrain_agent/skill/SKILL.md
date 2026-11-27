@@ -7,7 +7,8 @@ description: Drive a gatedtrain project through its MCP tools and stop for the p
 
 gatedtrain turns a goal, a data file and a pipeline into a trained model with a verdict (PASS, FAIL or INCONCLUSIVE)
 that it computes itself from a sealed test, a pre-registered metric and a budget. You drive it; you do not judge it.
-The person makes every trust decision.
+The person makes every trust decision. This text matches gatedtrain 0.7.1 and gatedtrain-pack-vlm-clevr 0.3.1; read
+what a newer release prints before relying on a detail here.
 
 ## Setup (once, by the person)
 
@@ -51,6 +52,44 @@ All paths are absolute. A relative or missing `root` is refused.
 - A refusal about the budget (GPU hours) goes to the person. Do not look for a way around it or raise the budget.
 - Use only the keeper socket the person gives you. Never start a keeper (`keeper serve`) and never run `setup`.
 - GPU jobs, cluster access and credentials are the person's to approve.
+
+## Keeper mode: say which one produced the result
+
+The keeper's mode is observed by gatedtrain (never set by an option) and is printed as a `keeper mode:` line.
+- **same-user** (default of `gatedtrain setup keeper`, no sudo): the keeper runs as the person's own OS user and follows
+  the procedure, but the sealed data is NOT sealed from that account; anything running as the person, including you
+  with a shell, could read it. A PASS carries the qualifier "procedure followed; sealed data not protected from the
+  user's account".
+- **separate-user** (`gatedtrain setup keeper --mode separate-user`, one sudo for the person): the keeper has its own
+  OS user; this is the only mode whose result `gatedtrain verify` accepts with exit 0.
+- `gatedtrain verify` on a same-user result prints a warning naming the mode and exits 1. Only the person may rerun it
+  with `--accept-mode same-user`: that exits 0 for exactly that result and ends with `ACCEPTED WEAKER MODE: same-user
+  (...)`. Never pass `--accept-mode` yourself. A project created with `--require-keeper-mode separate-user` exits 3
+  on same-user evidence, option or not.
+- Quote the mode line in every summary of a result. Never call a same-user result sealed or hardened.
+
+## Greedy decoding (pack 0.3.1 default)
+
+- The VLM pack registers greedy decoding explicitly: `decoding: greedy`, temperature 0, `top_p` 1.0 and
+  one evaluation seed (so K=1, one sample per item). temperature 0 alone does not register it, and several seeds are refused.
+- The keeper checks it (AN-26): it generates every sealed item once more under an unregistered control seed and
+  compares. Any difference refuses the attempt, settles it as not passed and costs its alpha.
+- The pack's generator therefore runs one request at a time (`max_num_seqs=1`, prefix caching off). Do not change
+  it, the vLLM version or the GPU without the person: the determinism probe has to be rerun first. A greedy score is not
+  comparable with one at temperature 0.7.
+
+## Images and owner-side settings (the person's, never yours)
+
+- Trainer images come from gatedtrain's image lock: `data/image-lock.json` shipped with the release, plus the person's
+  own `images.json` (under `$XDG_CONFIG_HOME/gatedtrain/`) added with `gatedtrain image add`. `gatedtrain --json image list`
+  shows what is accepted. Never add, widen or edit an image or the lock to get a stage through; no variable or flag
+  supplies an accepted image, so a refusal goes to the person.
+- Owner settings live in the person's host file (`host.toml` under `$XDG_CONFIG_HOME/gatedtrain/`): the bounds
+  `gpu_cap_h` and `gpu_mem_limit_gb`, `input_roots`, `interpreter_trees`, `interpreter`, `mirror_root` and
+  `[packs.<name>]` tables (for example `runtime_dir`); the keeper's `--eval-python` and `--gpu-wait-s` are set when the
+  person starts it. Never write these files or raise a bound.
+- The `GATEDTRAIN_EXT_*` variables and a pack's runtime variables are deprecated and removed in 0.9.0; `ext-*`
+  commands print a notice naming the host file key that replaces each. If you see one, tell the person.
 
 ## Never
 
